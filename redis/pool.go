@@ -17,6 +17,7 @@ package redis
 import (
 	"container/list"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -35,51 +36,41 @@ var errPoolClosed = errors.New("redigo: connection pool closed")
 //
 // The following example shows how to use a pool in a web application. The
 // application creates a pool at application startup and makes it available to
-// request handlers using a global variable.
+// request handlers using a global variable:
 //
-//  func newPool(server, password string) *redis.Pool {
-//      return &redis.Pool{
-//          MaxIdle: 3,
-//          IdleTimeout: 240 * time.Second,
-//          Dial: func () (redis.Conn, error) {
-//              c, err := redis.Dial("tcp", server)
-//              if err != nil {
-//                  return nil, err
-//              }
-//              if _, err := c.Do("AUTH", password); err != nil {
-//                  c.Close()
-//                  return nil, err
-//              }
-//              return c, err
-//          },
-//          TestOnBorrow: func(c redis.Conn, t time.Time) error {
-//              _, err := c.Do("PING")
-//              return err
-//          },
-//      }
-//  }
-//
-//  var (
-//      pool *redis.Pool
-//      redisServer = flag.String("redisServer", ":6379", "")
-//      redisPassword = flag.String("redisPassword", "", "")
-//  )
-//
-//  func main() {
-//      floag.Parse()
-//      pool = newPool(*redisServer, *redisPassword)
+//      var server string           // host:port of server
+//      var password string
 //      ...
-//  }
+//
+//      pool = &redis.Pool{
+//              MaxIdle: 3,
+//              IdleTimeout: 240 * time.Second,
+//              Dial: func () (redis.Conn, error) {
+//                  c, err := redis.Dial("tcp", server)
+//                  if err != nil {
+//                      return nil, err
+//                  }
+//                  if _, err := c.Do("AUTH", password); err != nil {
+//                      c.Close()
+//                      return nil, err
+//                  }
+//                  return c, err
+//              },
+//				TestOnBorrow: func(c redis.Conn, t time.Time) error {
+//				    _, err := c.Do("PING")
+//                  return err
+//			    },
+//          }
+//
+// This pool has a maximum of three connections to the server specified by the
+// variable "server". Each connection is authenticated using a password.
 //
 // A request handler gets a connection from the pool and closes the connection
 // when the handler is done:
 //
-//  func serveHome(w http.ResponseWriter, r *http.Request) {
-//      conn := pool.Get()
-//      defer conn.Close()
-//      ....
-//  }
-//
+//  conn := pool.Get()
+//  defer conn.Close()
+//  // do something with the connection
 type Pool struct {
 
 	// Dial is an application supplied function for creating new connections.
@@ -111,6 +102,9 @@ type Pool struct {
 
 	// Stack of idleConn with most recently used at the front.
 	idle list.List
+
+	// Max Timeout waiting for Pool
+	MaxActiveTimeout time.Duration
 }
 
 type idleConn struct {
@@ -118,9 +112,10 @@ type idleConn struct {
 	t time.Time
 }
 
-// NewPool is a convenience function for initializing a pool.
+// NewPool returns a pool that uses newPool to create connections as needed.
+// The pool keeps a maximum of maxIdle idle connections.
 func NewPool(newFn func() (Conn, error), maxIdle int) *Pool {
-	return &Pool{Dial: newFn, MaxIdle: maxIdle}
+	return &Pool{Dial: newFn, MaxIdle: maxIdle, MaxActiveTimeout: 30 * time.Second}
 }
 
 // Get gets a connection from the pool.
@@ -180,6 +175,16 @@ func (p *Pool) get() (Conn, error) {
 		}
 	}
 
+	// if no idle connections, wait for one to be available
+	if p.MaxActive > 0 && p.active >= p.MaxActive {
+		p.mu.Unlock()
+		//fmt.Println("REDIGO: Waiting for connection...")
+		for t := time.Duration(0); t < p.MaxActiveTimeout; t = t + 50*time.Millisecond {
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		p.mu.Lock()
+	}
 	// Get idle connection.
 
 	for i, n := 0, p.idle.Len(); i < n; i++ {
@@ -201,6 +206,7 @@ func (p *Pool) get() (Conn, error) {
 
 	if p.MaxActive > 0 && p.active >= p.MaxActive {
 		p.mu.Unlock()
+		fmt.Println("REDIGO: ERROR ON GETTING CONNECTION...")
 		return nil, ErrPoolExhausted
 	}
 
